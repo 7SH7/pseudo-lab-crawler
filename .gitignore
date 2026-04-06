@@ -33,5 +33,8 @@ Thumbs.db
 # Claude
 .claude/
 
+# Temp
+tmp/
+
 # Environment
 .env
