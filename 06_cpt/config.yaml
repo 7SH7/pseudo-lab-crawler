@@ -1,0 +1,93 @@
+# =============================================================================
+# CPT 중형 모델 학습 설정
+# 담당자: 김승환
+#
+# 수정해야 할 부분:
+#   1. data.path                   : 수형님 서버의 통합 데이터 경로
+#   2. data.science_source_values  : 통합본에서 "과학"으로 간주할 source 값
+#   3. data.general_source_values  : 통합본에서 "일반"으로 간주할 source 값
+#   4. model.base                  : 모델 베이스 (미확정 — 결정되면 한 줄만 수정)
+# =============================================================================
+
+# ─── 모델 ───────────────────────────────────────────────────────────────────
+model:
+  # TBD — 중형 모델 베이스 미확정.
+  # 후보: Qwen/Qwen2.5-7B, Qwen/Qwen3-8B-Base, meta-llama/Meta-Llama-3-8B
+  # 결정되면 이 한 줄만 바꾸면 됩니다.
+  base: "Qwen/Qwen2.5-7B"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+
+# ─── 데이터 ─────────────────────────────────────────────────────────────────
+data:
+  # 수형님 서버의 통합 데이터 경로
+  # (parquet 파일 / jsonl / 디렉토리 / HF save_to_disk 디렉토리 모두 자동 인식)
+  path: "/path/to/suhyeong_server/integrated_corpus"
+
+  # peS2o 스키마 필드 (id, source, url, text, created, added, version)
+  schema: "peS2o"
+  source_field: "source"
+  text_field: "text"
+
+  # source 필드에서 "과학"으로 간주할 값들
+  # 수형님 통합본은 대부분 이 값. 추가 값 있으면 리스트에 더하면 됨.
+  science_source_values: ["pes2o_or_crawled"]
+
+  # source 필드에서 "일반"으로 간주할 값들
+  # 통합본에 일반 데이터가 없으면 빈 리스트로 두고 mixing.general_fallback_hf 사용.
+  general_source_values: ["general"]
+
+  # 80~85% 과학 + 15~20% 일반 비율 동적 검증·보정
+  mixing:
+    science_ratio_min: 0.80
+    science_ratio_max: 0.85
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 두 가지 모드 — auto_balance 토글
+    #
+    # "조건문으로 처리해줄래?" 요청에 대한 두 가지 해석을 모두 지원:
+    #
+    #   🅰️ 검증만 모드  (auto_balance: false)
+    #       80/20 맞나 확인하고 안 맞으면 경고만 띄우고 진행.
+    #       HF 다운로드 X. 수형님 통합 데이터를 그대로 신뢰.
+    #
+    #   🅱️ 보정까지 모드 (auto_balance: true)  ← 기본값
+    #       안 맞으면 HF 데이터셋에서 자동으로 보충해서 비율을 맞춤.
+    #       (과학 부족 → peS2o 보충, 일반 부족 → fineweb 보충)
+    #
+    # 수형님 통합 데이터를 이미 충분히 신뢰한다면 false 권장.
+    # ─────────────────────────────────────────────────────────────────────
+    auto_balance: true
+    # 과학 부족 시 보충할 HF 데이터셋 (None이면 보충 안 함)
+    science_fallback_hf: "allenai/peS2o"
+    # 일반 부족 시 보충할 HF 데이터셋 (None이면 과학 다운샘플로 맞춤)
+    general_fallback_hf: "HuggingFaceFW/fineweb"
+    # streaming 모드로 가져오기 (대용량 안전)
+    fallback_streaming: true
+    # HF에서 보충 시 가져올 컬럼명 (대상 데이터셋의 텍스트 필드)
+    fallback_text_field_science: "text"
+    fallback_text_field_general: "text"
+
+# ─── 학습 ───────────────────────────────────────────────────────────────────
+training:
+  output_dir: "./checkpoints"
+  num_epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_seq_length: 4096
+  gradient_checkpointing: true
+  bf16: true
+  save_steps: 1000
+  logging_steps: 50
+  save_total_limit: 3
+  seed: 42
+  # 토큰화 병렬 프로세스 수
+  preprocess_num_proc: 8
+
+# ─── GPU ────────────────────────────────────────────────────────────────────
+gpu:
+  type: "H100"      # 또는 "A100"
+  num_devices: 1    # 멀티 GPU면 run.sh가 자동 대응
