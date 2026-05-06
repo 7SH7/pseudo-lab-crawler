@@ -10,3 +10,6 @@ pyyaml>=6.0
 # 토큰화 가속
 sentencepiece>=0.1.99
 protobuf>=4.25.0
+
+# 모니터링 (loss 곡선/메트릭 시각화)
+tensorboard>=2.15.0

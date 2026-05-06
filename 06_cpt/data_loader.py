@@ -10,13 +10,15 @@ CPT 데이터 로더 — peS2o 스키마 통합 데이터 + 과학/일반 80~20 
        - 과학 부족 → HF에서 과학 데이터 보충 (또는 일반 다운샘플)
        - 과학 과다 → HF에서 일반 데이터 보충 (또는 과학 다운샘플)
     4. 토큰화
+    5. 시퀀스 패킹 (짧은 문서를 EOS로 이어붙여 max_length 꽉 채움)
+    6. train/eval 분할 + 토큰 통계 로깅
 """
 
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 
 logger = logging.getLogger(__name__)
 
@@ -303,16 +305,26 @@ def tokenize_dataset(
     max_length: int,
     text_field: str = "text",
     num_proc: int = 4,
+    packing: bool = False,
 ) -> Dataset:
-    """text 필드 → input_ids로 토큰화."""
+    """text 필드 → input_ids로 토큰화.
 
-    def _tokenize(batch):
-        return tokenizer(
-            batch[text_field],
-            truncation=True,
-            max_length=max_length,
-            padding=False,
-        )
+    packing=False: 문서 1개 = 시퀀스 1개 (truncation, max_length까지).
+    packing=True:  truncation 없이 전체 토큰화 → 이후 pack_sequences로 합침.
+    """
+
+    if packing:
+        # 패킹은 truncation 없이 — 어차피 다음 단계에서 잘라낼 것
+        def _tokenize(batch):
+            return tokenizer(batch[text_field], add_special_tokens=False)
+    else:
+        def _tokenize(batch):
+            return tokenizer(
+                batch[text_field],
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+            )
 
     tokenized = dataset.map(
         _tokenize,
@@ -325,10 +337,84 @@ def tokenize_dataset(
 
 
 # =============================================================================
+# 5. 시퀀스 패킹 — 짧은 문서를 EOS로 이어붙여 max_length 꽉 채움
+# =============================================================================
+def pack_sequences(
+    tokenized: Dataset,
+    max_length: int,
+    eos_token_id: int,
+    num_proc: int = 4,
+) -> Dataset:
+    """문서 단위 토큰을 EOS로 구분해서 max_length 길이의 청크로 재배열.
+
+    효과: short doc 다수가 max_length까지 padding 되어 GPU 연산이 낭비되는 문제 해소.
+          같은 wall-clock에 학습 토큰량 5~10배 증가.
+    """
+
+    def _pack(examples):
+        # 배치 내 모든 input_ids를 EOS로 구분해 concat
+        concatenated: List[int] = []
+        for ids in examples["input_ids"]:
+            concatenated.extend(ids)
+            concatenated.append(eos_token_id)
+
+        # max_length 단위로 자름 (마지막 짜투리는 버림)
+        total_length = (len(concatenated) // max_length) * max_length
+        if total_length == 0:
+            return {"input_ids": [], "attention_mask": [], "labels": []}
+
+        chunks = [concatenated[i : i + max_length] for i in range(0, total_length, max_length)]
+        return {
+            "input_ids": chunks,
+            "attention_mask": [[1] * max_length for _ in chunks],
+            "labels": [list(c) for c in chunks],
+        }
+
+    packed = tokenized.map(
+        _pack,
+        batched=True,
+        batch_size=1000,
+        num_proc=num_proc,
+        remove_columns=tokenized.column_names,
+        desc="시퀀스 패킹",
+    )
+    return packed
+
+
+# =============================================================================
+# 6. 토큰 통계 로깅
+# =============================================================================
+def log_token_stats(dataset: Dataset, max_length: int, label: str = "train") -> int:
+    """학습 토큰 수 통계 — epoch 수 결정의 근거."""
+    n_seq = len(dataset)
+    if n_seq == 0:
+        logger.warning(f"[{label}] 시퀀스 0개")
+        return 0
+
+    # 패킹된 시퀀스는 max_length 가정, 안 패킹된 경우 실제 길이 합산
+    sample = dataset[0]
+    if len(sample["input_ids"]) == max_length:
+        total_tokens = n_seq * max_length
+    else:
+        total_tokens = sum(len(ids) for ids in dataset["input_ids"])
+
+    logger.info(
+        f"[{label}] 시퀀스 {n_seq:,}개 / 학습 토큰 약 {total_tokens:,} "
+        f"({total_tokens / 1e9:.2f}B)"
+    )
+    return total_tokens
+
+
+# =============================================================================
 # 진입점
 # =============================================================================
-def load_corpus(config: Dict[str, Any], tokenizer) -> Dataset:
-    """전체 파이프라인 — train.py에서 호출."""
+def load_corpus(config: Dict[str, Any], tokenizer) -> DatasetDict:
+    """전체 파이프라인 — train.py에서 호출.
+
+    Returns:
+        DatasetDict({"train": ..., "eval": ...})
+        eval_split=0이면 "eval"은 비어있음.
+    """
     data_cfg = config["data"]
     train_cfg = config.get("training", {})
 
@@ -347,12 +433,41 @@ def load_corpus(config: Dict[str, Any], tokenizer) -> Dataset:
     seed = train_cfg.get("seed", 42)
     mixed = adjust_mixing(science, general, data_cfg["mixing"], text_field, seed=seed)
 
+    max_length = train_cfg.get("max_seq_length", 4096)
+    num_proc = train_cfg.get("preprocess_num_proc", 4)
+    packing_cfg = data_cfg.get("packing", {})
+    use_packing = packing_cfg.get("enabled", True)
+
     tokenized = tokenize_dataset(
         mixed,
         tokenizer,
-        max_length=train_cfg.get("max_seq_length", 4096),
+        max_length=max_length,
         text_field=text_field,
-        num_proc=train_cfg.get("preprocess_num_proc", 4),
+        num_proc=num_proc,
+        packing=use_packing,
     )
-    logger.info(f"토큰화 완료: {len(tokenized):,}개 시퀀스")
-    return tokenized
+    logger.info(f"토큰화 완료: {len(tokenized):,}개 문서")
+
+    if use_packing:
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            raise ValueError("tokenizer.eos_token_id가 None — 패킹 불가")
+        packed = pack_sequences(tokenized, max_length, eos_id, num_proc=num_proc)
+        logger.info(f"패킹 완료: {len(tokenized):,}개 문서 → {len(packed):,}개 시퀀스")
+        tokenized = packed
+
+    # train/eval 분할
+    eval_ratio = float(packing_cfg.get("eval_split", 0.005))
+    if eval_ratio > 0 and len(tokenized) > 100:
+        split = tokenized.train_test_split(test_size=eval_ratio, seed=seed)
+        train_ds = split["train"]
+        eval_ds = split["test"]
+    else:
+        train_ds = tokenized
+        eval_ds = tokenized.select(range(0))  # 빈 데이터셋
+
+    log_token_stats(train_ds, max_length, label="train")
+    if len(eval_ds) > 0:
+        log_token_stats(eval_ds, max_length, label="eval")
+
+    return DatasetDict({"train": train_ds, "eval": eval_ds})
