@@ -24,15 +24,61 @@ pip install -r requirements.txt
 | `data.path` | 데이터 | 수형님 서버의 통합 데이터 경로 |
 | `data.science_source_values` | 데이터 | 통합본의 source 필드에서 "과학"으로 간주할 값 (기본: `["pes2o_or_crawled"]`) |
 | `data.general_source_values` | 데이터 | source 필드에서 "일반"으로 간주할 값 (없으면 빈 리스트) |
-| `model.base` | 모델 | 중형 모델 베이스 (현재 미정 — 결정되면 한 줄 수정) |
+| `model.base` + `model.fsdp_transformer_layer_cls` | 모델 | **두 줄 같이 변경** (아래 표 참고) |
 | `gpu.num_devices` | GPU | 실행 환경의 GPU 장 수 (run.sh가 `CUDA_VISIBLE_DEVICES`로 자동 인식) |
+
+### 모델별 설정 매핑 (`model.base` 와 `fsdp_transformer_layer_cls` 같이)
+
+| 모델 | `model.base` | `model.fsdp_transformer_layer_cls` | 인증 |
+|---|---|---|---|
+| Qwen2.5-7B | `Qwen/Qwen2.5-7B` | `Qwen2DecoderLayer` | 불필요 |
+| Qwen3-8B-Base | `Qwen/Qwen3-8B-Base` | `Qwen3DecoderLayer` | 불필요 |
+| Llama-3-8B | `meta-llama/Meta-Llama-3-8B` | `LlamaDecoderLayer` | `huggingface-cli login` 필요 |
 
 데이터 포맷 자동 인식:
 - HF `save_to_disk` 디렉토리 (`dataset_info.json` 포함)
 - `.parquet` 단일 파일 또는 디렉토리
 - `.jsonl` 단일 파일 또는 디렉토리
 
+### `source` 컬럼 실제 값 확인 (필수)
+
+`data.science_source_values` / `data.general_source_values`에 어떤 값을 넣어야 할지
+모르겠다면, 통합 데이터에서 직접 확인:
+
+```python
+from datasets import load_from_disk  # 또는 load_dataset
+ds = load_from_disk("/실제/통합데이터/경로")
+print(set(ds["source"][:5000]))   # 어떤 값들이 박혀있는지
+```
+
+여기서 나온 값을 config.yaml에 그대로 넣으면 됨.
+
 ## 3. 실행
+
+### (선택) 사전 검증 — dry-run
+
+학습 들어가기 전에 데이터 경로/source 값/패킹이 정상 동작하는지 한 번 확인:
+
+```bash
+cd 06_cpt
+python -c "
+import yaml
+from transformers import AutoTokenizer
+from data_loader import load_corpus
+
+cfg = yaml.safe_load(open('config.yaml'))
+tok = AutoTokenizer.from_pretrained(cfg['model']['base'], trust_remote_code=True)
+if tok.pad_token is None:
+    tok.pad_token = tok.eos_token
+ds = load_corpus(cfg, tok)
+print('Train:', len(ds['train']), 'Eval:', len(ds['eval']))
+"
+```
+
+콘솔에 비율 로그(`초기 비율: 과학 ... / 일반 ...`)와 토큰 통계가 정상 출력되면 OK.
+모델 가중치는 다운로드되지만 학습은 안 시작합니다.
+
+### 본 학습
 
 ```bash
 # 단일 GPU
@@ -45,6 +91,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 bash run.sh
 `run.sh`가 `CUDA_VISIBLE_DEVICES`의 장 수를 보고:
 - 1장: `python train.py`
 - 2장 이상: `accelerate launch --use_fsdp ...` 로 자동 분기
+
+### 디스크 공간 주의
+
+7B 모델 체크포인트 1개당 약 **14GB**. `save_total_limit: 3` 설정이라 동시에 최대 3개 + `final/` 까지 → 학습 디렉토리 **약 60GB** 점유.
+추가로 토큰화 캐시(`~/.cache/huggingface/datasets/`)가 데이터 양에 따라 **수십 GB** 소요.
+
+→ 학습 시작 전 **여유 디스크 100GB 이상** 권장.
 
 ## 4. 결과
 
